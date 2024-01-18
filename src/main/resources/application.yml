@@ -1,0 +1,12 @@
+server:
+  port: 8080
+
+# Wechat(wx) official account configuration information:
+# originalid: Original ID
+# appid: Personal AppID
+# token: In self definition setting in official account website(used for authentication)
+wx:
+  config:
+    originalid: gh_c5f3aefcb7c7
+    appid: wxcd4029157fc00b47
+    token: 6b6b
