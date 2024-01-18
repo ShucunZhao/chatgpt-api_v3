@@ -21,7 +21,10 @@ import org.springframework.web.bind.annotation.*;
 import javax.annotation.Resource;
 import java.util.Collections;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 /**
  * @descriptrion: Connect to Wechat official account, deal with the request service
@@ -38,18 +41,24 @@ public class WeiXinPortalController {
     @Resource
     private IWeiXinValidateService weiXinValidateService;
 
-    private OpenAiSession openAiSession;
+    //Upgraded here
+    private final OpenAiSession openAiSession;
 
     @Resource
     private ThreadPoolTaskExecutor taskExecutor;
 
-    private Map<String, String> chatGPTMap = new ConcurrentHashMap<>();
+    //Upgraded here
+    //private Map<String, String> chatGPTMap = new ConcurrentHashMap<>();
+    // Store the return data of OpenAi
+    private final Map<String, String> openAiDataMap = new ConcurrentHashMap<>();
+    // Store the invoke times of OpenAi
+    private final Map<String, Integer> openAiRetryCountMap = new ConcurrentHashMap<>();
 
     public WeiXinPortalController() {
         // 1.Configuration file:
         Configuration configuration = new Configuration();
         configuration.setApiHost("https://api.openai.com/");
-        configuration.setApiKey("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");
+        configuration.setApiKey("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");
         // 测试时候，需要先获得授权token：http://api.xfg.im:8080/authorize?username=xfg&password=123 - 此地址暂时有效，后续根据课程首页说明获取token；https://t.zsxq.com/0d3o5FKvc
         //configuration.setAuthToken("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4ZmciLCJleHAiOjE2ODMyODE2NzEsImlhdCI6MTY4MzI3ODA3MSwianRpIjoiMWUzZTkwYjYtY2UyNy00NzNlLTk5ZTYtYWQzMWU1MGVkNWE4IiwidXNlcm5hbWUiOiJ4ZmcifQ.YgQRJ2U5-9uydtd6Wbkg2YatsoX-y8mS_OJ3FdNRaX0");
 //        configuration.setApiHost("https://api.xfg.im/b8b6/");
@@ -96,7 +105,9 @@ public class WeiXinPortalController {
     }
 
     public void doChatGPTTask(String content) {
-        chatGPTMap.put(content, "NULL");
+        //Upgraded
+        //chatGPTMap.put(content, "NULL");
+        openAiDataMap.put(content, "NULL");
         taskExecutor.execute(() -> {
             // OpenAI request
             // 1. Create parameter
@@ -105,15 +116,35 @@ public class WeiXinPortalController {
                     .messages(Collections.singletonList(Message.builder().role(Constants.Role.USER).content(content).build()))
                     .model(ChatCompletionRequest.Model.GPT_3_5_TURBO.getCode())
                     .build();
+            //Upgraded
             // 2. Make a request
-            ChatCompletionResponse chatCompletionResponse = openAiSession.completions(chatCompletion);
+//            ChatCompletionResponse chatCompletionResponse = openAiSession.completions(chatCompletion);
+            // 2. Make a request asynchronously
+            CompletableFuture<ChatCompletionResponse> future = CompletableFuture.supplyAsync(() -> openAiSession.completions(chatCompletion));
+
+            //Upgraded
+            /*
             // 3. Parse result
             StringBuilder messages = new StringBuilder();
             chatCompletionResponse.getChoices().forEach(e -> {
                 messages.append(e.getMessage().getContent());
             });
-
             chatGPTMap.put(content, messages.toString());
+             */
+            // 3. Parse result asynchronously
+            future.thenAccept(chatCompletionResponse -> {
+                StringBuilder messages = new StringBuilder();
+                chatCompletionResponse.getChoices().forEach(e -> {
+                    messages.append(e.getMessage().getContent());
+                });
+                openAiDataMap.put(content, messages.toString());
+            }).exceptionally(e -> {
+                // Handle exceptions
+                e.printStackTrace();
+                // Update retry count
+                openAiRetryCountMap.merge(content, 1, Integer::sum);
+                return null;
+            });
         });
     }
 
@@ -132,7 +163,9 @@ public class WeiXinPortalController {
         try {
             logger.info("Receive WeChat public account information requests{}Start {}", openid, requestBody);
             MessageTextEntity message = XmlUtil.xmlToBean(requestBody, MessageTextEntity.class);
-//            System.out.println("The message of line 134 is: "+message);
+            //Upgraded
+            logger.info("Request times：{}", null == openAiRetryCountMap.get(message.getContent().trim()) ? 1 : openAiRetryCountMap.get(message.getContent().trim()));
+            /*
             // Asynchronous tasks
             if (chatGPTMap.get(message.getContent().trim()) == null || "NULL".equals(chatGPTMap.get(message.getContent().trim()))) {
                 // Feedback message [text]
@@ -148,6 +181,46 @@ public class WeiXinPortalController {
 
                 return XmlUtil.beanToXml(res);
             }
+             */
+            // Asynchronous tasks [add timeout retry, for small-volume call feedback, the result can be returned within the valid number of retries]
+            if (openAiDataMap.get(message.getContent().trim()) == null || "NULL".equals(openAiDataMap.get(message.getContent().trim()))) {
+                String data = "Message processing, please sent me again with【" + message.getContent().trim() + "】";
+                // Sleep for waiting
+                Integer retryCount = openAiRetryCountMap.get(message.getContent().trim());
+                if (null == retryCount) {
+                    if (openAiDataMap.get(message.getContent().trim()) == null) {
+                        doChatGPTTask(message.getContent().trim());
+                    }
+                    logger.info("Time out and resend：{}", 1);
+                    openAiRetryCountMap.put(message.getContent().trim(), 1);
+                    TimeUnit.SECONDS.sleep(5);
+                    new CountDownLatch(1).await();
+                } else if (retryCount < 2) {
+                    retryCount = retryCount + 1;
+                    logger.info("Time out and resend：{}", retryCount);
+                    openAiRetryCountMap.put(message.getContent().trim(), retryCount);
+                    TimeUnit.SECONDS.sleep(5);
+                    new CountDownLatch(1).await();
+                } else {
+                    retryCount = retryCount + 1;
+                    logger.info("Time out and resend：{}", retryCount);
+                    openAiRetryCountMap.put(message.getContent().trim(), retryCount);
+                    TimeUnit.SECONDS.sleep(3);
+                    if (openAiDataMap.get(message.getContent().trim()) != null && !"NULL".equals(openAiDataMap.get(message.getContent().trim()))) {
+                        data = openAiDataMap.get(message.getContent().trim());
+                    }
+                }
+
+                // Feedback message [text]
+                MessageTextEntity res = new MessageTextEntity();
+                res.setToUserName(openid);
+                res.setFromUserName(originalId);
+                res.setCreateTime(String.valueOf(System.currentTimeMillis() / 1000L));
+                res.setMsgType("text");
+                res.setContent(data);
+
+                return XmlUtil.beanToXml(res);
+            }
 
             // Feedback message [text]
             MessageTextEntity res = new MessageTextEntity();
@@ -155,10 +228,10 @@ public class WeiXinPortalController {
             res.setFromUserName(originalId);
             res.setCreateTime(String.valueOf(System.currentTimeMillis() / 1000L));
             res.setMsgType("text");
-            res.setContent(chatGPTMap.get(message.getContent().trim()));
+            res.setContent(openAiDataMap.get(message.getContent().trim()));
             String result = XmlUtil.beanToXml(res);
             logger.info("Receive WeChat public account information requests{}Finished {}", openid, result);
-            chatGPTMap.remove(message.getContent().trim());
+            openAiDataMap.remove(message.getContent().trim());
             return result;
         } catch (Exception e) {
             logger.error("Receive WeChat public account information requests{}Failed {}", openid, requestBody, e);
